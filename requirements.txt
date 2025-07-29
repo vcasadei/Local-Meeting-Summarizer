@@ -1,5 +1,6 @@
 virtualenv>=20.32.0
 openai-whisper>=20250625
+faster-whisper>=1.1.1
 requests>=2.32.4
 tqdm>=4.67.1
 moviepy>=2.2.1

@@ -70,11 +70,14 @@ python summarize.py "/path/to/your/meeting_audio.mp3"
 
 # To use a different Ollama model (e.g., mistral)
 python summarize.py "my_meeting.mp4" --model mistral
+
+# Use the faster engine for transcription
+python summarize_fast.py "/path/to/your/meeting.mp4" --fast
+
+# Use Brazilian Portuguese Language
+python summarize_fast.py "reuniao_semanal.mp4" --language pt --fast
 ```
 ## Next Steps and Potential Improvements
-### Error Handling: The script has basic error handling, but you could make it more robust (e.g., checking if Ollama is reachable before starting transcription).
-
-### Performance: For transcribing long meetings, you might consider using faster-whisper, a re-implementation of Whisper that is significantly faster on CPUs.
 
 ### User Interface: This is a command-line tool. A great next step would be to wrap it in a simple graphical user interface (GUI) using a library like Tkinter or PyQt, or even a web interface using Flask or FastAPI.
 

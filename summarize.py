@@ -15,6 +15,29 @@ DEFAULT_MODEL = "llama3"
 SUPPORTED_VIDEO_FORMATS = ['.mp4', '.mkv', '.mov', '.avi']
 SUPPORTED_AUDIO_FORMATS = ['.mp3', '.wav', '.m4a', '.flac']
 
+def check_ollama_status() -> bool:
+    """
+    Checks if the Ollama server is running and reachable before starting processing.
+
+    :return: True if the server is reachable, False otherwise.
+    """
+    print("Checking connection to Ollama server...")
+    try:
+        # We perform a GET request to the base URL of Ollama.
+        # The API endpoint is for POST, but the root should respond to GET.
+        ollama_base_url = OLLAMA_URL.replace("/api/generate", "")
+        response = requests.get(ollama_base_url, timeout=5) # 5-second timeout
+        response.raise_for_status()
+        print("Ollama server is reachable.")
+        return True
+    except requests.exceptions.RequestException as e:
+        print("\n--- Ollama Connection Error ---")
+        print(f"Could not connect to the Ollama server at '{ollama_base_url}'.")
+        print("Please ensure the Ollama application is running on your machine.")
+        print(f"Error details: {e}")
+        print("---------------------------------\n")
+        return False
+
 def extract_audio(video_path: str) -> str:
     """
     Extracts the audio from a video file and saves it as a temporary MP3 file.
@@ -94,8 +117,6 @@ def summarize_text_with_ollama(text: str, model: str) -> str:
         response = requests.post(OLLAMA_URL, json=payload)
         response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
         
-        # The response from Ollama is a stream of JSON objects, one per line.
-        # We parse the final one to get the complete response.
         response_lines = response.text.strip().split('\n')
         final_response = json.loads(response_lines[-1])
         
@@ -103,7 +124,8 @@ def summarize_text_with_ollama(text: str, model: str) -> str:
         return final_response.get("response", "Error: Could not parse summary from Ollama response.")
 
     except requests.exceptions.RequestException as e:
-        return f"Error connecting to Ollama: {e}\nIs the Ollama server running?"
+        # This error is now less likely to be a simple connection error due to the initial check
+        return f"Error during summarization request to Ollama: {e}"
     except json.JSONDecodeError:
         return "Error: Could not decode the JSON response from Ollama."
 
@@ -116,6 +138,12 @@ def main():
     parser.add_argument("file_path", help="Path to the video or audio file of the meeting.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"The Ollama model to use for summarization (default: {DEFAULT_MODEL}).")
     args = parser.parse_args()
+
+    # --- Pre-flight Check: Verify Ollama Connection ---
+    # This is the new, improved error handling step.
+    # We check for the server before doing any heavy processing.
+    if not check_ollama_status():
+        return # Exit the script if Ollama is not available.
 
     file_path = args.file_path
     ollama_model = args.model
