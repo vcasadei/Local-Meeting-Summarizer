@@ -3,13 +3,16 @@ import os
 import argparse
 import requests
 import json
+import sys
 from moviepy.editor import VideoFileClip
 from tqdm import tqdm
+from datetime import timedelta
 
-# --- Dynamic Imports ---
-# We will import the transcription library based on user choice
+# --- Dynamic Imports for optional features ---
 whisper = None
 faster_whisper = None
+pyannote_audio = None
+torch = None
 
 # --- Configuration ---
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -36,7 +39,7 @@ def extract_audio(video_path: str) -> str:
     try:
         video = VideoFileClip(video_path)
         audio_path = "temp_audio.mp3"
-        video.audio.write_audiofile(audio_path, codec='mp3', logger=None) # Set logger to None to hide moviepy output
+        video.audio.write_audiofile(audio_path, codec='mp3', logger=None)
         video.close()
         print(f"Audio extracted successfully to '{audio_path}'.")
         return audio_path
@@ -44,109 +47,153 @@ def extract_audio(video_path: str) -> str:
         print(f"Error extracting audio: {e}")
         return None
 
-def transcribe_audio(audio_path: str, use_fast_whisper: bool, language: str) -> (str, str):
+def transcribe_and_diarize(audio_path: str, language: str) -> str:
     """
-    Transcribes the audio file using either the original or the fast Whisper implementation.
+    Performs speaker diarization and then transcribes, assigning speakers to text.
 
     :param audio_path: Path to the audio file.
-    :param use_fast_whisper: Boolean flag to select the transcription engine.
-    :param language: The language for transcription (e.g., 'en', 'pt'). None for auto-detect.
-    :return: A tuple containing the detected language and the full transcript.
+    :param language: The language for transcription.
+    :return: A formatted string with speaker-labeled transcript.
     """
+    global pyannote_audio, torch, faster_whisper
+    if pyannote_audio is None or torch is None:
+        import torch
+        from pyannote.audio import Pipeline
+        pyannote_audio = Pipeline
+    
+    if faster_whisper is None:
+        from faster_whisper import WhisperModel
+        faster_whisper = WhisperModel
+
+    # 1. Diarization
+    print("Step 1: Performing speaker diarization...")
+    try:
+        # Use a Hugging Face token if available, otherwise it relies on CLI login
+        hf_token = os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        diarization_pipeline = pyannote_audio.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
+        # Send pipeline to GPU if available
+        if torch.cuda.is_available():
+            diarization_pipeline = diarization_pipeline.to("cuda")
+        
+        diarization = diarization_pipeline(audio_path)
+        print("Diarization complete.")
+    except Exception as e:
+        print("\n--- Pyannote Error ---")
+        print(f"Failed to run pyannote.audio pipeline: {e}")
+        print("Please ensure you have accepted the user agreements on Hugging Face Hub for the models and logged in via 'huggingface-cli login'.")
+        print("------------------------\n")
+        sys.exit(1)
+
+
+    # 2. Transcription with word-level timestamps
+    print("Step 2: Transcribing audio with word timestamps...")
     model_name = "base"
-    transcribe_options = {"language": language} if language else {}
-    
-    if use_fast_whisper:
-        # --- Using faster-whisper ---
-        global faster_whisper
-        if faster_whisper is None:
-            from faster_whisper import WhisperModel
-            faster_whisper = WhisperModel
-            
-        print(f"Loading faster-whisper model '{model_name}' (this may download the model on first run)...")
-        model = faster_whisper(model_name, device="auto", compute_type="default")
-        
-        print(f"Model loaded. Starting transcription (faster-whisper) for language: {language or 'auto'}...")
-        segments, info = model.transcribe(audio_path, beam_size=5, vad_filter=True, **transcribe_options)
-        
-        transcript_parts = []
-        total_duration = round(info.duration, 2)
-        with tqdm(total=total_duration, unit=" seconds", desc="Transcribing") as pbar:
-            for segment in segments:
-                transcript_parts.append(segment.text)
-                pbar.update(segment.end - segment.start)
-        
-        transcript = "".join(transcript_parts).strip()
-        detected_language = info.language
-        
-    else:
-        # --- Using original whisper ---
-        global whisper
-        if whisper is None:
-            import whisper as original_whisper
-            whisper = original_whisper
+    model = faster_whisper(model_name, device="auto", compute_type="default")
+    segments, _ = model.transcribe(audio_path, language=language, word_timestamps=True)
 
-        print(f"Loading original whisper model '{model_name}'...")
-        model = whisper.load_model(model_name)
-        print(f"Model loaded. Starting transcription for language: {language or 'auto'}...")
-        result = model.transcribe(audio_path, fp16=False, verbose=False, **transcribe_options)
-        transcript = result["text"]
-        detected_language = result["language"]
-
+    # Flatten the segments into a list of words
+    all_words = []
+    for segment in segments:
+        for word in segment.words:
+            all_words.append({'start': word.start, 'end': word.end, 'word': word.word})
     print("Transcription complete.")
-    return detected_language, transcript
 
-def get_prompt(language: str, text: str) -> str:
-    """
-    Generates the appropriate prompt for Ollama based on the selected language.
+    # 3. Merging diarization and transcription
+    print("Step 3: Merging diarization and transcription results...")
+    result = []
+    speaker_turns = list(diarization.itertracks(yield_label=True))
+    
+    for word in all_words:
+        word_center = (word['start'] + word['end']) / 2
+        assigned_speaker = "UNKNOWN"
+        for turn, _, speaker in speaker_turns:
+            if turn.start <= word_center <= turn.end:
+                assigned_speaker = speaker
+                break
+        result.append({'speaker': assigned_speaker, 'word': word['word'], 'start': word['start']})
 
-    :param language: The language for the summary ('pt' for Portuguese).
-    :param text: The transcript to be summarized.
-    :return: The fully formatted prompt string.
-    """
-    if language == 'pt':
-        return f"""
-        Você é um assistente especialista em resumir reuniões.
-        Sua tarefa é criar um resumo conciso e estruturado da seguinte transcrição de reunião, em Português do Brasil.
+    # 4. Formatting the final transcript
+    final_transcript = ""
+    current_speaker = None
+    current_line = ""
+    line_start_time = None
 
-        Por favor, forneça o resumo em três seções:
-        1.  **Principais Tópicos Discutidos**: Uma visão geral dos principais pontos e assuntos abordados.
-        2.  **Decisões Tomadas**: Uma lista com marcadores de quaisquer decisões que foram acordadas.
-        3.  **Itens de Ação**: Uma lista com marcadores de tarefas atribuídas a indivíduos, incluindo quem é o responsável, se mencionado.
+    for res in result:
+        if current_speaker != res['speaker']:
+            if current_speaker is not None:
+                timestamp = str(timedelta(seconds=int(line_start_time))).zfill(8)
+                final_transcript += f"[{timestamp}] {current_speaker}:{current_line}\n"
+            
+            current_speaker = res['speaker']
+            line_start_time = res['start']
+            current_line = res['word']
+        else:
+            current_line += res['word']
+    
+    # Add the last line
+    if current_speaker is not None:
+        timestamp = str(timedelta(seconds=int(line_start_time))).zfill(8)
+        final_transcript += f"[{timestamp}] {current_speaker}:{current_line}\n"
+        
+    print("Merging complete.")
+    return final_transcript.strip()
 
-        Se alguma destas seções não for aplicável (por exemplo, nenhuma decisão foi tomada), declare isso claramente.
-        Não adicione nenhum comentário ou informação que não estivesse presente na transcrição.
 
-        Aqui está a transcrição:
-        ---
-        {text}
-        ---
-        """
-    else: # Default to English
-        return f"""
-        You are an expert assistant specialized in summarizing meetings.
-        Your task is to create a concise and structured summary of the following meeting transcript.
+def get_prompt(language: str, text: str, is_diarized: bool) -> str:
+    """Generates the appropriate prompt for Ollama based on the context."""
+    if is_diarized:
+        if language == 'pt':
+            return f"""
+            Você é um assistente especialista em resumir reuniões a partir de transcrições com identificação de quem falou (diarização).
+            A transcrição inclui rótulos como 'SPEAKER_00', 'SPEAKER_01', etc.
 
-        Please provide the summary in three sections:
-        1.  **Key Topics Discussed**: A brief overview of the main points and subjects covered.
-        2.  **Decisions Made**: A bulleted list of any decisions that were agreed upon.
-        3.  **Action Items**: A bulleted list of tasks assigned to individuals, including who is responsible if mentioned.
+            Sua tarefa é criar um resumo conciso e estruturado, em Português do Brasil, e usar os rótulos dos locutores ao atribuir itens.
+            Forneça o resumo em três seções:
+            1.  **Principais Tópicos Discutidos**: Resumo dos pontos principais.
+            2.  **Decisões Tomadas**: Lista de decisões acordadas.
+            3.  **Itens de Ação**: Lista de tarefas atribuídas, especificando o locutor responsável (e.g., "SPEAKER_01 precisa enviar o relatório.").
 
-        If any of these sections are not applicable (e.g., no decisions were made), state that clearly.
-        Do not add any commentary or information that was not present in the transcript.
+            Transcrição da Reunião:
+            ---
+            {text}
+            ---
+            """
+        else: # English Diarized
+            return f"""
+            You are an expert assistant for summarizing meetings from diarized transcripts.
+            The transcript includes speaker labels like 'SPEAKER_00', 'SPEAKER_01', etc.
 
-        Here is the transcript:
-        ---
-        {text}
-        ---
-        """
+            Your task is to create a concise, structured summary and use the speaker labels when assigning items.
+            Provide the summary in three sections:
+            1.  **Key Topics Discussed**: Overview of main points.
+            2.  **Decisions Made**: Bulleted list of agreed-upon decisions.
+            3.  **Action Items**: Bulleted list of assigned tasks, specifying the responsible speaker (e.g., "SPEAKER_01 to send the report.").
 
-def summarize_text_with_ollama(text: str, model: str, language: str) -> str:
-    """Sends the transcript to Ollama to generate a summary in the specified language."""
+            Meeting Transcript:
+            ---
+            {text}
+            ---
+            """
+    else: # Non-Diarized (original prompts)
+        if language == 'pt':
+            return f"""
+            Você é um assistente especialista em resumir reuniões.
+            Sua tarefa é criar um resumo conciso e estruturado da seguinte transcrição de reunião, em Português do Brasil.
+            Forneça o resumo em três seções: Principais Tópicos Discutidos, Decisões Tomadas, e Itens de Ação.
+            Aqui está a transcrição:\n---\n{text}\n---
+            """
+        else:
+            return f"""
+            You are an expert assistant specialized in summarizing meetings.
+            Your task is to create a concise and structured summary of the following meeting transcript.
+            Provide the summary in three sections: Key Topics Discussed, Decisions Made, and Action Items.
+            Here is the transcript:\n---\n{text}\n---
+            """
+
+def summarize_text_with_ollama(text: str, model: str, language: str, is_diarized: bool) -> str:
+    """Sends the transcript to Ollama to generate a summary."""
     print(f"Sending transcript to Ollama using model '{model}' for summarization...")
-    
-    prompt = get_prompt(language, text)
-    
+    prompt = get_prompt(language, text, is_diarized)
     payload = {"model": model, "prompt": prompt, "stream": False}
     try:
         response = requests.post(OLLAMA_URL, json=payload)
@@ -162,30 +209,25 @@ def summarize_text_with_ollama(text: str, model: str, language: str) -> str:
 
 def main():
     """Main function to orchestrate the process."""
-    parser = argparse.ArgumentParser(description="Transcribe and summarize a meeting recording with performance options.")
+    parser = argparse.ArgumentParser(description="Transcribe and summarize a meeting recording with diarization.")
     parser.add_argument("file_path", help="Path to the video or audio file of the meeting.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"The Ollama model to use for summarization (default: {DEFAULT_MODEL}).")
-    parser.add_argument("--fast", action="store_true", help="Use the faster-whisper implementation for transcription.")
-    parser.add_argument("--language", type=str, default=None, help="Language of the meeting audio (e.g., 'en', 'pt', 'es'). If not specified, Whisper will auto-detect.")
+    parser.add_argument("--language", type=str, default='en', help="Language of the meeting audio (e.g., 'en', 'pt', 'es').")
+    parser.add_argument("--diarize", action="store_true", help="Enable speaker diarization (requires pyannote.audio).")
     args = parser.parse_args()
 
-    if not check_ollama_status():
-        return
+    if not check_ollama_status(): return
 
-    if args.fast:
+    if args.diarize:
         try:
-            import faster_whisper
+            import pyannote.audio, torch, faster_whisper
         except ImportError:
-            print("\n--- Dependency Error ---")
-            print("The '--fast' option requires the 'faster-whisper' library.")
-            print("Please install it by running: pip install faster-whisper")
-            print("------------------------\n")
+            print("\n--- Dependency Error ---\n'--diarize' requires 'pyannote.audio', 'torch', and 'faster-whisper'.\nInstall with: pip install pyannote.audio faster-whisper\n------------------------\n")
             return
 
     file_path = args.file_path
     if not os.path.exists(file_path):
-        print(f"Error: The file '{file_path}' was not found.")
-        return
+        print(f"Error: The file '{file_path}' was not found."); return
 
     file_ext = os.path.splitext(file_path)[1].lower()
     audio_path, is_temp_audio = None, False
@@ -197,18 +239,27 @@ def main():
     elif file_ext in SUPPORTED_AUDIO_FORMATS:
         audio_path = file_path
     else:
-        print(f"Error: Unsupported file format '{file_ext}'.")
-        return
+        print(f"Error: Unsupported file format '{file_ext}'."); return
 
     try:
-        detected_language, transcript = transcribe_audio(audio_path, args.fast, args.language)
-        print(f"\n--- Detected Language: {detected_language.upper()} ---")
+        transcript = ""
+        if args.diarize:
+            transcript = transcribe_and_diarize(audio_path, args.language)
+        else:
+            # Fallback to faster-whisper without diarization
+            global faster_whisper
+            if faster_whisper is None:
+                from faster_whisper import WhisperModel
+                faster_whisper = WhisperModel
+            model = faster_whisper("base", device="auto", compute_type="default")
+            segments, _ = model.transcribe(audio_path, language=args.language)
+            transcript = "\n".join([segment.text for segment in segments])
+
         print("\n--- Full Transcript ---")
         print(transcript)
 
         if transcript:
-            summary_lang = args.language if args.language else detected_language
-            summary = summarize_text_with_ollama(transcript, args.model, summary_lang)
+            summary = summarize_text_with_ollama(transcript, args.model, args.language, args.diarize)
             print("\n" + "="*50 + "\n          MEETING SUMMARY\n" + "="*50 + "\n")
             print(summary)
         else:

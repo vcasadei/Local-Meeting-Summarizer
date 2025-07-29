@@ -4,6 +4,9 @@ A local solution for summarizing online meetings
 ## Project Goal
 To create a command-line tool that takes a audio meeting recording, transcribes it to text, and then uses a local LLM (via Ollama) to generate a summary.
 
+### Feature Upgrade: Speaker Diarization
+To add speaker diarization, we will use the powerful `pyannote.audio library`. This requires a few one-time setup steps to get access to the pre-trained models, which are hosted on the [Hugging Face Hub](https://huggingface.co).
+
 ## Architecture
 The process will follow a simple pipeline:
 
@@ -57,7 +60,36 @@ The `moviepy` library depends on a system tool called `ffmpeg`.
 
 - macOS and Windows installers for Python libraries often handle this dependency automatically.
 
-Once you've completed these steps, you'll be ready to use the Python script.
+### Step 5: Create a Hugging Face Hub Account
+
+`pyannote` requires you to accept user conditions for its models.
+
+1. If you don't have one, create a free account on [huggingface.co](https://huggingface.co/join).
+
+2. Create an access token by going to your **Settings -> Access Tokens -> New token**. Give it a name (e.g., "pyannote") and the `read` role. Copy the token.
+
+### Step 6: Accept Model User Agreements
+
+You must visit the pages for the two models we'll be using and accept their terms of service. You must be logged into your Hugging Face account.
+
+1. Go to [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) and agree to the terms.
+
+2. Go to [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) and agree to the terms.
+
+### Step 7: Log in via your Terminal
+
+The easiest way to give your script access to the models is to log in from your command line.
+
+Run the following command:
+
+```shell
+huggingface-cli login
+```
+
+It will ask for your token. Paste the token you copied in Step 5 and press Enter.
+
+After completing these four steps, your environment will be ready to run the diarization script. This is a one-time setup.
+
 
 ## Running the script
 
@@ -76,9 +108,14 @@ python summarize_fast.py "/path/to/your/meeting.mp4" --fast
 
 # Use Brazilian Portuguese Language
 python summarize_fast.py "reuniao_semanal.mp4" --language pt --fast
+
+# Example of diarization for a meeting in Portuguese
+python summarize_fast.py "reuniao_com_clientes.mp4" --language pt --diarize
+
+# Example of diarization for a meeting in English
+python summarize_fast.py "team_sync.mp4" --language en --diarize
 ```
+
 ## Next Steps and Potential Improvements
 
 ### User Interface: This is a command-line tool. A great next step would be to wrap it in a simple graphical user interface (GUI) using a library like Tkinter or PyQt, or even a web interface using Flask or FastAPI.
-
-### Speaker Diarization: A more advanced feature would be to identify who said what. This is called speaker diarization and can be achieved with other libraries like pyannote.audio.
