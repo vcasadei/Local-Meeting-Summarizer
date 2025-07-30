@@ -11,7 +11,7 @@ The process will follow a simple pipeline:
 [Audio File] -> [1. Audio Extraction] -> [2. Transcription] -> [3. Summarization] -> [Meeting Summary]
 ```
 
-1. Audio Extraction: If the input is a video file (like a .mp4 from Zoom or Google Meet), we first need to extract the audio track into a format like .mp3. We will use the moviepy library for this. If the input is already an audio file, we can skip this step.
+1. Audio Extraction: Loading Audio File.
 
 2. Transcription (Speech-to-Text): This is the core of the first phase. We'll use OpenAI's Whisper model. While it's made by OpenAI, Whisper is an open-source model that you can download and run entirely on your local machine. It's highly accurate and has become the industry standard for local transcription.
 
@@ -44,18 +44,8 @@ pip install -r requirements.txt
 ```
 
 - openai-whisper: For local transcription.
-- moviepy: For extracting audio from video files.
 - requests: To communicate with the Ollama API.
 - tqdm: To show a nice progress bar during transcription, which can take some time.
-
-### Step 4: (For Linux) Install FFmpeg
-The `moviepy` library depends on a system tool called `ffmpeg`.
-
-- On Debian/Ubuntu: `sudo apt update && sudo apt install ffmpeg`
-
-- On Fedora/CentOS: `sudo dnf install ffmpeg`
-
-- macOS and Windows installers for Python libraries often handle this dependency automatically.
 
 Once you've completed these steps, you'll be ready to use the Python script.
 
@@ -72,10 +62,13 @@ python summarize.py "/path/to/your/meeting_audio.mp3"
 python summarize.py "my_meeting.mp4" --model mistral
 
 # Use the faster engine for transcription
-python summarize_fast.py "/path/to/your/meeting.mp4" --fast
+python summarize.py "/path/to/your/meeting.mp4" --fast
 
 # Use Brazilian Portuguese Language
-python summarize_fast.py "reuniao_semanal.mp4" --language pt --fast
+python summarize.py "reuniao_semanal.mp4" --language pt --fast
+
+# Use Brazilian Portuguese Language and GAIA model
+python summarize.py "reuniao_semanal.mp4" --language pt --model brunoconterato/Gemma-3-Gaia-PT-BR-4b-it:f16
 ```
 ## Next Steps and Potential Improvements
 

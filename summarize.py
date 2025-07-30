@@ -1,191 +1,204 @@
+# Save as: summarize_fast.py
 import os
 import argparse
-import whisper
 import requests
 import json
-from moviepy.editor import VideoFileClip
 from tqdm import tqdm
 
+# --- Dynamic Imports ---
+# We will import the transcription library based on user choice
+whisper = None
+faster_whisper = None
+
 # --- Configuration ---
-# URL for the Ollama API endpoint. It's usually running on localhost.
 OLLAMA_URL = "http://localhost:11434/api/generate"
-# Default model to use for summarization. Make sure you have pulled this model with "ollama run <model_name>"
 DEFAULT_MODEL = "llama3"
-# Supported audio and video formats
-SUPPORTED_VIDEO_FORMATS = ['.mp4', '.mkv', '.mov', '.avi']
 SUPPORTED_AUDIO_FORMATS = ['.mp3', '.wav', '.m4a', '.flac']
 
 def check_ollama_status() -> bool:
-    """
-    Checks if the Ollama server is running and reachable before starting processing.
-
-    :return: True if the server is reachable, False otherwise.
-    """
+    """Checks if the Ollama server is running and reachable."""
     print("Checking connection to Ollama server...")
     try:
-        # We perform a GET request to the base URL of Ollama.
-        # The API endpoint is for POST, but the root should respond to GET.
         ollama_base_url = OLLAMA_URL.replace("/api/generate", "")
-        response = requests.get(ollama_base_url, timeout=5) # 5-second timeout
+        response = requests.get(ollama_base_url, timeout=5)
         response.raise_for_status()
         print("Ollama server is reachable.")
         return True
     except requests.exceptions.RequestException as e:
-        print("\n--- Ollama Connection Error ---")
-        print(f"Could not connect to the Ollama server at '{ollama_base_url}'.")
-        print("Please ensure the Ollama application is running on your machine.")
-        print(f"Error details: {e}")
-        print("---------------------------------\n")
+        print(f"\n--- Ollama Connection Error ---\nCould not connect to the Ollama server at '{ollama_base_url}'.\nPlease ensure the Ollama application is running.\nError details: {e}\n---------------------------------\n")
         return False
 
-def extract_audio(video_path: str) -> str:
+def transcribe_audio(audio_path: str, use_fast_whisper: bool, language: str) -> (str, str):
     """
-    Extracts the audio from a video file and saves it as a temporary MP3 file.
-
-    :param video_path: Path to the video file.
-    :return: The path to the extracted audio file.
-    """
-    print(f"Extracting audio from '{video_path}'...")
-    try:
-        video = VideoFileClip(video_path)
-        audio_path = "temp_audio.mp3"
-        video.audio.write_audiofile(audio_path, codec='mp3')
-        video.close()
-        print(f"Audio extracted successfully to '{audio_path}'.")
-        return audio_path
-    except Exception as e:
-        print(f"Error extracting audio: {e}")
-        return None
-
-def transcribe_audio(audio_path: str) -> (str, str):
-    """
-    Transcribes the given audio file using the Whisper model.
+    Transcribes the audio file using either the original or the fast Whisper implementation.
 
     :param audio_path: Path to the audio file.
+    :param use_fast_whisper: Boolean flag to select the transcription engine.
+    :param language: The language for transcription (e.g., 'en', 'pt'). None for auto-detect.
     :return: A tuple containing the detected language and the full transcript.
     """
-    print("Loading Whisper model...")
-    # Using the "base" model is a good balance of speed and accuracy for an MVP.
-    # For higher accuracy, you can use "medium" or "large", but they are slower.
-    model = whisper.load_model("base")
-    print("Model loaded. Starting transcription (this may take a while)...")
+    model_name = "base"
+    transcribe_options = {"language": language} if language else {}
     
-    # The 'fp16=False' option might be necessary for CPU-only execution.
-    # If you have a compatible GPU, you can remove it for a speed boost.
-    result = model.transcribe(audio_path, fp16=False, verbose=False)
-    
+    if use_fast_whisper:
+        # --- Using faster-whisper ---
+        global faster_whisper
+        if faster_whisper is None:
+            from faster_whisper import WhisperModel
+            faster_whisper = WhisperModel
+            
+        print(f"Loading faster-whisper model '{model_name}' (this may download the model on first run)...")
+        model = faster_whisper(model_name, device="auto", compute_type="default")
+        
+        print(f"Model loaded. Starting transcription (faster-whisper) for language: {language or 'auto'}...")
+        segments, info = model.transcribe(audio_path, beam_size=5, vad_filter=True, **transcribe_options)
+        
+        transcript_parts = []
+        total_duration = round(info.duration, 2)
+        with tqdm(total=total_duration, unit=" seconds", desc="Transcribing") as pbar:
+            for segment in segments:
+                transcript_parts.append(segment.text)
+                pbar.update(segment.end - segment.start)
+        
+        transcript = "".join(transcript_parts).strip()
+        detected_language = info.language
+        
+    else:
+        # --- Using original whisper ---
+        global whisper
+        if whisper is None:
+            import whisper as original_whisper
+            whisper = original_whisper
+
+        print(f"Loading original whisper model '{model_name}'...")
+        model = whisper.load_model(model_name)
+        print(f"Model loaded. Starting transcription for language: {language or 'auto'}...")
+        result = model.transcribe(audio_path, fp16=False, verbose=False, **transcribe_options)
+        transcript = result["text"]
+        detected_language = result["language"]
+
     print("Transcription complete.")
-    return result["language"], result["text"]
+    return detected_language, transcript
 
-def summarize_text_with_ollama(text: str, model: str) -> str:
+def get_prompt(language: str, text: str) -> str:
     """
-    Sends the transcript to Ollama to generate a summary.
+    Generates the appropriate prompt for Ollama based on the selected language.
 
-    :param text: The full transcript of the meeting.
-    :param model: The name of the Ollama model to use.
-    :return: The generated summary as a string.
+    :param language: The language for the summary ('pt' for Portuguese).
+    :param text: The transcript to be summarized.
+    :return: The fully formatted prompt string.
     """
-    print(f"Sending transcript to Ollama using model '{model}' for summarization...")
+    if language == 'pt':
+        return f"""
+        Você é um assistente especialista em resumir reuniões.
+        Sua tarefa é criar um resumo conciso e estruturado da seguinte transcrição de reunião, em Português do Brasil.
+        Não me faça perguntas, somente faça o resumo em Português do Brasil.
 
-    # This is the prompt that instructs the LLM on how to behave.
-    # Good prompting is key to getting good results.
-    prompt = f"""
-    You are an expert assistant specialized in summarizing meetings.
-    Your task is to create a concise and structured summary of the following meeting transcript.
+        Por favor, forneça o resumo em três seções:
+        1.  **Principais Tópicos Discutidos**: Uma visão geral dos principais pontos e assuntos abordados.
+        2.  **Decisões Tomadas**: Uma lista com marcadores de quaisquer decisões que foram acordadas.
+        3.  **Itens de Ação**: Uma lista com marcadores de tarefas atribuídas a indivíduos, incluindo quem é o responsável, se mencionado.
 
-    Please provide the summary in three sections:
-    1.  **Key Topics Discussed**: A brief overview of the main points and subjects covered.
-    2.  **Decisions Made**: A bulleted list of any decisions that were agreed upon.
-    3.  **Action Items**: A bulleted list of tasks assigned to individuals, including who is responsible if mentioned.
+        Se alguma destas seções não for aplicável (por exemplo, nenhuma decisão foi tomada), declare isso claramente.
+        Não adicione nenhum comentário ou informação que não estivesse presente na transcrição.
 
-    If any of these sections are not applicable (e.g., no decisions were made), state that clearly.
-    Do not add any commentary or information that was not present in the transcript.
+        Aqui está a transcrição:
+        ---
+        {text}
+        ---
+        """
+    else: # Default to English
+        return f"""
+        You are an expert assistant specialized in summarizing meetings.
+        Your task is to create a concise and structured summary of the following meeting transcript.
 
-    Here is the transcript:
-    ---
-    {text}
-    ---
-    """
+        Please provide the summary in three sections:
+        1.  **Key Topics Discussed**: A brief overview of the main points and subjects covered.
+        2.  **Decisions Made**: A bulleted list of any decisions that were agreed upon.
+        3.  **Action Items**: A bulleted list of tasks assigned to individuals, including who is responsible if mentioned.
 
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False  # We want the full response at once
-    }
+        If any of these sections are not applicable (e.g., no decisions were made), state that clearly.
+        Do not add any commentary or information that was not present in the transcript.
 
+        Here is the transcript:
+        ---
+        {text}
+        ---
+        """
+
+def summarize_text_with_ollama(text: str, model: str, language: str) -> str:
+    """Sends the transcript to Ollama to generate a summary in the specified language."""
+    print(f"Sending transcript to Ollama using model '{model}' for summarization with language {language}...")
+    
+    prompt = get_prompt(language, text)
+
+    if language == 'pt':
+        model = "brunoconterato/Gemma-3-Gaia-PT-BR-4b-it:f16"
+
+    payload = {"model": model, "prompt": prompt, "stream": False}
     try:
         response = requests.post(OLLAMA_URL, json=payload)
-        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
-        
+        response.raise_for_status()
         response_lines = response.text.strip().split('\n')
         final_response = json.loads(response_lines[-1])
-        
         print("Summary received from Ollama.")
         return final_response.get("response", "Error: Could not parse summary from Ollama response.")
-
     except requests.exceptions.RequestException as e:
-        # This error is now less likely to be a simple connection error due to the initial check
         return f"Error during summarization request to Ollama: {e}"
     except json.JSONDecodeError:
         return "Error: Could not decode the JSON response from Ollama."
 
-
 def main():
-    """
-    Main function to orchestrate the transcription and summarization process.
-    """
-    parser = argparse.ArgumentParser(description="Transcribe and summarize a meeting recording.")
+    """Main function to orchestrate the process."""
+    parser = argparse.ArgumentParser(description="Transcribe and summarize a meeting recording with performance options.")
     parser.add_argument("file_path", help="Path to the video or audio file of the meeting.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"The Ollama model to use for summarization (default: {DEFAULT_MODEL}).")
+    parser.add_argument("--fast", action="store_true", help="Use the faster-whisper implementation for transcription.")
+    parser.add_argument("--language", type=str, default=None, help="Language of the meeting audio (e.g., 'en', 'pt', 'es'). If not specified, Whisper will auto-detect.")
     args = parser.parse_args()
 
-    # --- Pre-flight Check: Verify Ollama Connection ---
-    # This is the new, improved error handling step.
-    # We check for the server before doing any heavy processing.
     if not check_ollama_status():
-        return # Exit the script if Ollama is not available.
+        return
+
+    if args.fast:
+        try:
+            import faster_whisper
+        except ImportError:
+            print("\n--- Dependency Error ---")
+            print("The '--fast' option requires the 'faster-whisper' library.")
+            print("Please install it by running: pip install faster-whisper")
+            print("------------------------\n")
+            return
 
     file_path = args.file_path
-    ollama_model = args.model
-
     if not os.path.exists(file_path):
         print(f"Error: The file '{file_path}' was not found.")
         return
 
     file_ext = os.path.splitext(file_path)[1].lower()
-    audio_path = None
-    is_temp_audio = False
+    audio_path, is_temp_audio = None, False
 
-    if file_ext in SUPPORTED_VIDEO_FORMATS:
-        audio_path = extract_audio(file_path)
-        if audio_path is None:
-            return
-        is_temp_audio = True
-    elif file_ext in SUPPORTED_AUDIO_FORMATS:
+    if file_ext in SUPPORTED_AUDIO_FORMATS:
         audio_path = file_path
     else:
         print(f"Error: Unsupported file format '{file_ext}'.")
-        print(f"Supported video: {SUPPORTED_VIDEO_FORMATS}")
-        print(f"Supported audio: {SUPPORTED_AUDIO_FORMATS}")
         return
 
     try:
-        language, transcript = transcribe_audio(audio_path)
-        print(f"\n--- Detected Language: {language.upper()} ---")
+        detected_language, transcript = transcribe_audio(audio_path, args.fast, args.language)
+        print(f"\n--- Detected Language: {detected_language.upper()} ---")
         print("\n--- Full Transcript ---")
         print(transcript)
 
         if transcript:
-            summary = summarize_text_with_ollama(transcript, ollama_model)
-            print("\n" + "="*50)
-            print("          MEETING SUMMARY")
-            print("="*50 + "\n")
+            summary_lang = args.language if args.language else detected_language
+            summary = summarize_text_with_ollama(transcript, args.model, summary_lang)
+            print("\n" + "="*50 + "\n          MEETING SUMMARY\n" + "="*50 + "\n")
             print(summary)
         else:
             print("\nTranscript is empty, cannot generate summary.")
 
     finally:
-        # Clean up the temporary audio file if one was created
         if is_temp_audio and os.path.exists(audio_path):
             print(f"\nCleaning up temporary file '{audio_path}'...")
             os.remove(audio_path)
