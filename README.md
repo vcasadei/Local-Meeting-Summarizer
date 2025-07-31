@@ -14,7 +14,7 @@ The process will follow a simple pipeline:
 [Audio File] -> [1. Audio Extraction] -> [2. Transcription] -> [3. Summarization] -> [Meeting Summary]
 ```
 
-1. Audio Extraction: If the input is a video file (like a .mp4 from Zoom or Google Meet), we first need to extract the audio track into a format like .mp3. We will use the moviepy library for this. If the input is already an audio file, we can skip this step.
+1. Audio Extraction: Loads Audio File.
 
 2. Transcription (Speech-to-Text): This is the core of the first phase. We'll use OpenAI's Whisper model. While it's made by OpenAI, Whisper is an open-source model that you can download and run entirely on your local machine. It's highly accurate and has become the industry standard for local transcription.
 
@@ -51,44 +51,33 @@ pip install -r requirements.txt
 - requests: To communicate with the Ollama API.
 - tqdm: To show a nice progress bar during transcription, which can take some time.
 
-### Step 4: (For Linux) Install FFmpeg
-The `moviepy` library depends on a system tool called `ffmpeg`.
+### Step 4: Hugging Face Hub Setup (for Diarization)
 
-- On Debian/Ubuntu: `sudo apt update && sudo apt install ffmpeg`
+If you plan to use the `--diarize` feature, you need to authenticate with Hugging Face to use the `pyannote` models.
 
-- On Fedora/CentOS: `sudo dnf install ffmpeg`
+1. **Create a Hugging Face Account**: If you don't have one, create a free account on [huggingface.co/join](https://huggingface.co/join).
 
-- macOS and Windows installers for Python libraries often handle this dependency automatically.
+2. **Create an Access Token**: Go to your **Settings -> Access Tokens -> New token**. Give it a name (e.g., "pyannote") and the read role. Copy the generated token.
 
-### Step 5: Create a Hugging Face Hub Account
+3. **Accept Model User Agreements**: You must visit the pages for the models we'll be using and accept their terms of service. You must be logged into your Hugging Face account.
 
-`pyannote` requires you to accept user conditions for its models.
+- [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
 
-1. If you don't have one, create a free account on [huggingface.co](https://huggingface.co/join).
+- [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
 
-2. Create an access token by going to your **Settings -> Access Tokens -> New token**. Give it a name (e.g., "pyannote") and the `read` role. Copy the token.
+4. **Provide the Token to the Script**: You have two options to provide your token. The script will use the first one it finds:
 
-### Step 6: Accept Model User Agreements
+- **Option A (Recommended)**: Pass the token directly as a command-line argument. This is the most direct method.
 
-You must visit the pages for the two models we'll be using and accept their terms of service. You must be logged into your Hugging Face account.
-
-1. Go to [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) and agree to the terms.
-
-2. Go to [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) and agree to the terms.
-
-### Step 7: Log in via your Terminal
-
-The easiest way to give your script access to the models is to log in from your command line.
-
-Run the following command:
-
-```shell
-huggingface-cli login
+```
+--hf_token YOUR_COPIED_TOKEN_HERE
 ```
 
-It will ask for your token. Paste the token you copied in Step 5 and press Enter.
+- **Option B (Alternative)**: Use the `huggingface-cli login` command. This will cache the token on your machine for the script to use if no token is provided via the command line.
 
-After completing these four steps, your environment will be ready to run the diarization script. This is a one-time setup.
+```
+huggingface-cli login
+```
 
 
 ## Running the script
@@ -114,6 +103,9 @@ python summarize_fast.py "reuniao_com_clientes.mp4" --language pt --diarize
 
 # Example of diarization for a meeting in English
 python summarize_fast.py "team_sync.mp4" --language en --diarize
+
+# Example of diarization using a Hugging Face Token directly
+python summarize.py "/Users/vcasadei/Documents/GitHub/Local-Meeting-Summarizer/amicorpus/REUNIAO_RH_21082020.mp3" --language pt --diarize --hf_token token --model brunoconterato/Gemma-3-Gaia-PT-BR-4b-it:f16
 ```
 
 ## Next Steps and Potential Improvements

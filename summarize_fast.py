@@ -4,9 +4,16 @@ import argparse
 import requests
 import json
 import sys
-from moviepy.editor import VideoFileClip
 from tqdm import tqdm
 from datetime import timedelta
+import warnings
+
+# --- Suppress Warnings ---
+# Pyannote and its dependencies can generate a lot of non-critical warnings.
+# This will make the output cleaner.
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 
 # --- Dynamic Imports for optional features ---
 whisper = None
@@ -17,7 +24,6 @@ torch = None
 # --- Configuration ---
 OLLAMA_URL = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "llama3"
-SUPPORTED_VIDEO_FORMATS = ['.mp4', '.mkv', '.mov', '.avi']
 SUPPORTED_AUDIO_FORMATS = ['.mp3', '.wav', '.m4a', '.flac']
 
 def check_ollama_status() -> bool:
@@ -33,26 +39,23 @@ def check_ollama_status() -> bool:
         print(f"\n--- Ollama Connection Error ---\nCould not connect to the Ollama server at '{ollama_base_url}'.\nPlease ensure the Ollama application is running.\nError details: {e}\n---------------------------------\n")
         return False
 
-def extract_audio(video_path: str) -> str:
-    """Extracts audio from a video file into a temporary MP3."""
-    print(f"Extracting audio from '{video_path}'...")
-    try:
-        video = VideoFileClip(video_path)
-        audio_path = "temp_audio.mp3"
-        video.audio.write_audiofile(audio_path, codec='mp3', logger=None)
-        video.close()
-        print(f"Audio extracted successfully to '{audio_path}'.")
-        return audio_path
-    except Exception as e:
-        print(f"Error extracting audio: {e}")
-        return None
-
-def transcribe_and_diarize(audio_path: str, language: str) -> str:
+def transcribe_and_diarize(
+    audio_path: str, 
+    language: str, 
+    whisper_model_name: str, 
+    hf_token: str = None,
+    min_speakers: int = None,
+    max_speakers: int = None
+) -> str:
     """
     Performs speaker diarization and then transcribes, assigning speakers to text.
 
     :param audio_path: Path to the audio file.
     :param language: The language for transcription.
+    :param whisper_model_name: The size of the Whisper model to use.
+    :param hf_token: Optional Hugging Face Hub token.
+    :param min_speakers: Minimum number of speakers.
+    :param max_speakers: Maximum number of speakers.
     :return: A formatted string with speaker-labeled transcript.
     """
     global pyannote_audio, torch, faster_whisper
@@ -68,34 +71,32 @@ def transcribe_and_diarize(audio_path: str, language: str) -> str:
     # 1. Diarization
     print("Step 1: Performing speaker diarization...")
     try:
-        # Use a Hugging Face token if available, otherwise it relies on CLI login
-        hf_token = os.environ.get("HUGGING_FACE_HUB_TOKEN")
-        diarization_pipeline = pyannote_audio.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
-        # Send pipeline to GPU if available
+        auth_token = hf_token or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        diarization_pipeline = pyannote_audio.from_pretrained(
+            "pyannote/speaker-diarization-3.1", 
+            use_auth_token=auth_token
+        )
+        
         if torch.cuda.is_available():
             diarization_pipeline = diarization_pipeline.to("cuda")
         
-        diarization = diarization_pipeline(audio_path)
+        print(f"Diarizing with settings: min_speakers={min_speakers}, max_speakers={max_speakers}")
+        # The 'num_workers' parameter has been removed to fix the compatibility issue.
+        diarization = diarization_pipeline(
+            audio_path, 
+            min_speakers=min_speakers, 
+            max_speakers=max_speakers
+        )
         print("Diarization complete.")
     except Exception as e:
-        print("\n--- Pyannote Error ---")
-        print(f"Failed to run pyannote.audio pipeline: {e}")
-        print("Please ensure you have accepted the user agreements on Hugging Face Hub for the models and logged in via 'huggingface-cli login'.")
-        print("------------------------\n")
+        print(f"\n--- Pyannote Error ---\nFailed to run pyannote.audio pipeline: {e}\n------------------------\n")
         sys.exit(1)
 
-
     # 2. Transcription with word-level timestamps
-    print("Step 2: Transcribing audio with word timestamps...")
-    model_name = "base"
-    model = faster_whisper(model_name, device="auto", compute_type="default")
+    print(f"Step 2: Transcribing audio with word timestamps using '{whisper_model_name}' model...")
+    model = faster_whisper(whisper_model_name, device="auto", compute_type="int8")
     segments, _ = model.transcribe(audio_path, language=language, word_timestamps=True)
-
-    # Flatten the segments into a list of words
-    all_words = []
-    for segment in segments:
-        for word in segment.words:
-            all_words.append({'start': word.start, 'end': word.end, 'word': word.word})
+    all_words = [word for segment in segments for word in segment.words]
     print("Transcription complete.")
 
     # 3. Merging diarization and transcription
@@ -104,13 +105,13 @@ def transcribe_and_diarize(audio_path: str, language: str) -> str:
     speaker_turns = list(diarization.itertracks(yield_label=True))
     
     for word in all_words:
-        word_center = (word['start'] + word['end']) / 2
+        word_center = (word.start + word.end) / 2
         assigned_speaker = "UNKNOWN"
         for turn, _, speaker in speaker_turns:
             if turn.start <= word_center <= turn.end:
                 assigned_speaker = speaker
                 break
-        result.append({'speaker': assigned_speaker, 'word': word['word'], 'start': word['start']})
+        result.append({'speaker': assigned_speaker, 'word': word.word, 'start': word.start})
 
     # 4. Formatting the final transcript
     final_transcript = ""
@@ -130,7 +131,6 @@ def transcribe_and_diarize(audio_path: str, language: str) -> str:
         else:
             current_line += res['word']
     
-    # Add the last line
     if current_speaker is not None:
         timestamp = str(timedelta(seconds=int(line_start_time))).zfill(8)
         final_transcript += f"[{timestamp}] {current_speaker}:{current_line}\n"
@@ -138,9 +138,9 @@ def transcribe_and_diarize(audio_path: str, language: str) -> str:
     print("Merging complete.")
     return final_transcript.strip()
 
-
 def get_prompt(language: str, text: str, is_diarized: bool) -> str:
     """Generates the appropriate prompt for Ollama based on the context."""
+    # Prompts remain the same as before
     if is_diarized:
         if language == 'pt':
             return f"""
@@ -214,6 +214,11 @@ def main():
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"The Ollama model to use for summarization (default: {DEFAULT_MODEL}).")
     parser.add_argument("--language", type=str, default='en', help="Language of the meeting audio (e.g., 'en', 'pt', 'es').")
     parser.add_argument("--diarize", action="store_true", help="Enable speaker diarization (requires pyannote.audio).")
+    parser.add_argument("--hf_token", type=str, default=None, help="Your Hugging Face Hub token for accessing private models.")
+    parser.add_argument("--whisper_model", type=str, default="base", help="The whisper model size to use (e.g., 'tiny', 'base', 'small', 'medium').")
+    parser.add_argument("--min_speakers", type=int, default=None, help="Minimum number of speakers for diarization.")
+    parser.add_argument("--max_speakers", type=int, default=None, help="Maximum number of speakers for diarization.")
+    # The --num_workers argument has been removed.
     args = parser.parse_args()
 
     if not check_ollama_status(): return
@@ -232,11 +237,7 @@ def main():
     file_ext = os.path.splitext(file_path)[1].lower()
     audio_path, is_temp_audio = None, False
 
-    if file_ext in SUPPORTED_VIDEO_FORMATS:
-        audio_path = extract_audio(file_path)
-        if audio_path is None: return
-        is_temp_audio = True
-    elif file_ext in SUPPORTED_AUDIO_FORMATS:
+    if file_ext in SUPPORTED_AUDIO_FORMATS:
         audio_path = file_path
     else:
         print(f"Error: Unsupported file format '{file_ext}'."); return
@@ -244,14 +245,21 @@ def main():
     try:
         transcript = ""
         if args.diarize:
-            transcript = transcribe_and_diarize(audio_path, args.language)
+            transcript = transcribe_and_diarize(
+                audio_path, 
+                args.language, 
+                args.whisper_model, 
+                args.hf_token,
+                args.min_speakers,
+                args.max_speakers
+            )
         else:
-            # Fallback to faster-whisper without diarization
+            print(f"Transcribing audio with '{args.whisper_model}' model...")
             global faster_whisper
             if faster_whisper is None:
                 from faster_whisper import WhisperModel
                 faster_whisper = WhisperModel
-            model = faster_whisper("base", device="auto", compute_type="default")
+            model = faster_whisper(args.whisper_model, device="auto", compute_type="int8")
             segments, _ = model.transcribe(audio_path, language=args.language)
             transcript = "\n".join([segment.text for segment in segments])
 
